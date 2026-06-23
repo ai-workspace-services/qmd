@@ -31,6 +31,7 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
+import { isPgBackend, openMemoryBridge, type MemoryBridge } from "../pg/index.js";
 
 enableProductionMode();
 
@@ -172,7 +173,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-async function createMcpServer(store: QMDStore): Promise<McpServer> {
+async function createMcpServer(store: QMDStore, memory?: MemoryBridge): Promise<McpServer> {
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
     { instructions: await buildInstructions(store) },
@@ -533,7 +534,132 @@ Intent-aware lex (C++ performance, not sports):
     }
   );
 
+  // ---------------------------------------------------------------------------
+  // Memory bridge tools (PostgreSQL backend) — registered only when QMD_BACKEND=pg.
+  // Lets external agents (OpenClaw, Hermes, ...) share a namespaced, persistent
+  // memory store backed by pgvector + pg_jieba on postgresql.svc.plus.
+  // ---------------------------------------------------------------------------
+  if (memory) {
+    registerMemoryTools(server, memory);
+  }
+
   return server;
+}
+
+/** Register the PG-backed memory tools on an MCP server. */
+function registerMemoryTools(server: McpServer, memory: MemoryBridge): void {
+  server.registerTool(
+    "memory_search",
+    {
+      title: "Search Memory",
+      description:
+        "Hybrid search over shared agent memory (PostgreSQL). Fuses pg_jieba/tsvector " +
+        "lexical search with pgvector semantic search via RRF. Scoped to a namespace.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        query: z.string().describe("Natural language or keyword query"),
+        namespace: z.string().optional().describe("Tenant namespace (default: configured namespace)"),
+        limit: z.number().optional().default(10).describe("Max results"),
+        full: z.boolean().optional().default(false).describe("Return full body instead of a snippet"),
+      },
+    },
+    async ({ query, namespace, limit, full }) => {
+      const results = await memory.store.searchMemory(query, {
+        ...(namespace ? { namespace } : {}),
+        ...(limit ? { limit } : {}),
+        full: !!full,
+      });
+      if (results.length === 0) {
+        return { content: [{ type: "text", text: `No memory matches for: ${query}` }] };
+      }
+      const text = results
+        .map((r) => `### ${r.key} (#${r.docid}, score ${r.score.toFixed(4)})\n${r.title ? r.title + "\n" : ""}${r.body}`)
+        .join("\n\n");
+      return { content: [{ type: "text", text }], structuredContent: { results } };
+    },
+  );
+
+  server.registerTool(
+    "memory_add",
+    {
+      title: "Add Memory",
+      description:
+        "Store or replace a memory in the shared PostgreSQL store. Re-adding the same " +
+        "key updates it. Content is chunked, embedded, and indexed for hybrid search.",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        key: z.string().describe("Logical id within the namespace (like a path/slug)"),
+        body: z.string().describe("The memory content to store and index"),
+        title: z.string().optional().describe("Optional human title"),
+        namespace: z.string().optional().describe("Tenant namespace (default: configured namespace)"),
+        metadata: z.record(z.string(), z.unknown()).optional().describe("Arbitrary JSON metadata"),
+      },
+    },
+    async ({ key, body, title, namespace, metadata }) => {
+      const res = await memory.store.addMemory({
+        key,
+        body,
+        ...(title ? { title } : {}),
+        ...(namespace ? { namespace } : {}),
+        ...(metadata ? { metadata } : {}),
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Stored "${res.key}" (#${res.docid}) in namespace "${res.namespace}": ${res.chunks} chunk(s), ${res.embedded ? "embedded" : "no embedding"}.`,
+          },
+        ],
+        structuredContent: { ...res },
+      };
+    },
+  );
+
+  server.registerTool(
+    "memory_get",
+    {
+      title: "Get Memory",
+      description: "Fetch a single memory's full body by key from the shared PostgreSQL store.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        key: z.string().describe("The memory key"),
+        namespace: z.string().optional().describe("Tenant namespace (default: configured namespace)"),
+      },
+    },
+    async ({ key, namespace }) => {
+      const rec = await memory.store.getMemory(key, namespace ? { namespace } : undefined);
+      if (!rec) {
+        return { content: [{ type: "text", text: `Memory not found: ${key}` }], isError: true };
+      }
+      return {
+        content: [{ type: "text", text: `${rec.title ? rec.title + "\n\n" : ""}${rec.body}` }],
+        structuredContent: { ...rec },
+      };
+    },
+  );
+
+  server.registerTool(
+    "memory_list",
+    {
+      title: "List Memory",
+      description: "List memories in a namespace (most recently updated first).",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        namespace: z.string().optional().describe("Tenant namespace (default: configured namespace)"),
+        limit: z.number().optional().default(100).describe("Max entries"),
+      },
+    },
+    async ({ namespace, limit }) => {
+      const rows = await memory.store.listMemories({
+        ...(namespace ? { namespace } : {}),
+        ...(limit ? { limit } : {}),
+      });
+      const text = rows.length
+        ? rows.map((r) => `- ${r.key} (#${r.docid}) ${r.title}`).join("\n")
+        : "No memories.";
+      return { content: [{ type: "text", text }], structuredContent: { memories: rows } };
+    },
+  );
 }
 
 // =============================================================================
@@ -546,9 +672,25 @@ export async function startMcpServer(): Promise<void> {
     dbPath: getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
-  const server = await createMcpServer(store);
+  const memory = await maybeOpenMemoryBridge();
+  const server = await createMcpServer(store, memory);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+}
+
+/**
+ * Open the PG memory bridge when QMD_BACKEND=pg, otherwise return undefined so
+ * the SQLite-only experience is unchanged. Failures are logged (not fatal) so a
+ * misconfigured PG never takes down local document search.
+ */
+async function maybeOpenMemoryBridge(): Promise<MemoryBridge | undefined> {
+  if (!isPgBackend()) return undefined;
+  try {
+    return await openMemoryBridge();
+  } catch (err) {
+    console.error(`[qmd:mcp] memory bridge disabled: ${(err as Error).message}`);
+    return undefined;
+  }
 }
 
 // =============================================================================
@@ -575,6 +717,9 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
 
+  // Shared memory bridge (PG backend) — one pool for all sessions.
+  const memory = await maybeOpenMemoryBridge();
+
   // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
   // The store is shared — it's stateless SQLite, safe for concurrent access.
   const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
@@ -588,7 +733,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
       },
     });
-    const server = await createMcpServer(store);
+    const server = await createMcpServer(store, memory);
     await server.connect(transport);
 
     transport.onclose = () => {
@@ -813,6 +958,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     sessions.clear();
     httpServer.close();
     await store.close();
+    if (memory) await memory.dispose();
   };
 
   process.on("SIGTERM", async () => {
