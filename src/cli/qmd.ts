@@ -100,6 +100,7 @@ import {
   loadConfig,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
+import { runMemoryCommand, runPgCommand } from "./pg-commands.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -2533,6 +2534,9 @@ function parseCLI() {
       delete: { type: "boolean" },
       update: { type: "boolean" },
       embed: { type: "boolean" },
+      // Memory bridge (PG backend) options
+      namespace: { type: "string" },  // tenant namespace (openclaw/hermes/...)
+      title: { type: "string" },      // memory title
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2723,6 +2727,8 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skill show/install        - Show or install the packaged QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("  qmd memory add/search/get/rm  - Shared PG memory bridge (needs QMD_BACKEND=pg)");
+  console.log("  qmd pg status                 - Show PostgreSQL memory backend health");
   console.log("  qmd sync [--dry-run]          - Secure two-way sync with a remote QMD host");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
@@ -3429,6 +3435,17 @@ if (isMain) {
 
       closeDb();
       break;
+    }
+
+    case "memory":
+    case "mem": {
+      const code = await runMemoryCommand(cli.args, cli.values);
+      process.exit(code);
+    }
+
+    case "pg": {
+      const code = await runPgCommand(cli.args, cli.values);
+      process.exit(code);
     }
 
     default:
