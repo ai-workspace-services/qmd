@@ -100,7 +100,7 @@ import {
   loadConfig,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
-import { runMemoryCommand, runPgCommand } from "./pg-commands.js";
+import { runMemoryCommand, runPgCommand, runTaskCommand } from "./pg-commands.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -2537,6 +2537,14 @@ function parseCLI() {
       // Memory bridge (PG backend) options
       namespace: { type: "string" },  // tenant namespace (openclaw/hermes/...)
       title: { type: "string" },      // memory title
+      // Task coordination options
+      ttl: { type: "string" },        // claim lifetime in seconds
+      scope: { type: "string" },      // project key (default: from git remote)
+      agent: { type: "string" },      // agent identity override
+      note: { type: "string" },       // note recorded on release
+      pr: { type: "string" },         // associated PR number
+      status: { type: "string" },     // done | abandoned (release)
+      stale: { type: "boolean" },     // include TTL-lapsed claims in ls
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2729,6 +2737,7 @@ function showHelp(): void {
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
   console.log("  qmd memory add/search/get/rm  - Shared PG memory bridge (needs QMD_BACKEND=pg)");
   console.log("  qmd pg status                 - Show PostgreSQL memory backend health");
+  console.log("  qmd task claim/who/release    - Multi-agent coordination (needs QMD_BACKEND=pg)");
   console.log("  qmd sync [--dry-run]          - Secure two-way sync with a remote QMD host");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
@@ -3445,6 +3454,11 @@ if (isMain) {
 
     case "pg": {
       const code = await runPgCommand(cli.args, cli.values);
+      process.exit(code);
+    }
+
+    case "task": {
+      const code = await runTaskCommand(cli.args, cli.values);
       process.exit(code);
     }
 
